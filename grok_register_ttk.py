@@ -8,6 +8,7 @@ Grok 注册机 - TTK GUI 版本
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import time
 import os
@@ -616,8 +617,24 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-browser = None
-page = None
+# 线程本地存储：每个注册线程拥有独立的 browser/page，互不干扰
+_tl = threading.local()
+
+
+def _get_browser():
+    return getattr(_tl, "browser", None)
+
+
+def _set_browser(val):
+    _tl.browser = val
+
+
+def _get_page():
+    return getattr(_tl, "page", None)
+
+
+def _set_page(val):
+    _tl.page = val
 
 
 def setup_light_theme(root):
@@ -722,38 +739,37 @@ def tk_option_menu(parent, variable, values, width=12):
 
 
 def start_browser(log_callback=None):
-    global browser, page
     last_exc = None
     for attempt in range(1, 5):
         try:
-            browser = Chromium(create_browser_options())
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
-            if log_callback and getattr(browser, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
+            _set_browser(Chromium(create_browser_options()))
+            _br = _get_browser()
+            tabs = _br.get_tabs()
+            _set_page(tabs[-1] if tabs else _br.new_tab())
+            if log_callback and getattr(_br, "user_data_path", None):
+                log_callback(f"[Debug] 当前浏览器资料目录: {_br.user_data_path}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
-            return browser, page
+            return _get_browser(), _get_page()
         except Exception as exc:
             last_exc = exc
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                if _get_browser() is not None:
+                    _get_browser().quit(del_data=True)
             except Exception:
                 pass
-            browser = None
-            page = None
+            _set_browser(None)
+            _set_page(None)
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
-    current = browser
-    browser = None
-    page = None
+    current = _get_browser()
+    _set_browser(None)
+    _set_page(None)
     if current is None:
         return
     try:
@@ -785,18 +801,17 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 
 
 def refresh_active_page():
-    global browser, page
-    if browser is None:
+    if _get_browser() is None:
         restart_browser()
     try:
-        tabs = browser.get_tabs()
+        tabs = _get_browser().get_tabs()
         if tabs:
-            page = tabs[-1]
+            _set_page(tabs[-1])
         else:
-            page = browser.new_tab()
+            _set_page(_get_browser().new_tab())
     except Exception:
         restart_browser()
-    return page
+    return _get_page()
 
 
 def extract_cf_clearance_and_ua(log_callback=None):
@@ -838,7 +853,7 @@ def extract_cf_clearance_and_ua(log_callback=None):
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
+    page = _get_page()
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -906,12 +921,14 @@ return candidates[0].text || true;
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
     raise_if_cancelled(cancel_callback)
+    browser = _get_browser()
     if browser is None:
         start_browser()
+        browser = _get_browser()
         if log_callback:
             log_callback("[*] 浏览器已启动")
+    page = _get_page()
     try:
         page = browser.get_tab(0)
         page.get(SIGNUP_URL)
@@ -924,7 +941,9 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             if log_callback:
                 log_callback(f"[Debug] 创建新标签页异常: {e2}")
             restart_browser()
+            browser = _get_browser()
             page = browser.new_tab(SIGNUP_URL)
+    _set_page(page)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
@@ -936,6 +955,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
 
 def has_profile_form(log_callback=None):
     refresh_active_page()
+    page = _get_page()
     try:
         return bool(
             page.run_js(
@@ -966,6 +986,7 @@ def _email_page_advanced_once(email):
       - True：页面已前进，提交生效
       - False：仍停留在邮箱输入页
     """
+    page = _get_page()
     try:
         return bool(
             page.run_js(
@@ -1029,6 +1050,7 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
 
 
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
+    page = _get_page()
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
@@ -1296,6 +1318,7 @@ return 'enter';
 
 
 def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cancel_callback=None):
+    page = _get_page()
     def _resend_code():
         page.run_js(
             r"""
@@ -1438,7 +1461,7 @@ return 'clicked';
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    global page
+    page = _get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -1543,6 +1566,7 @@ def build_profile():
 
 
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
+    page = _get_page()
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     form_filled_once = False
@@ -1778,6 +1802,7 @@ return String(cfInput.value || '').trim().length;
 
 
 def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
+    page = _get_page()
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0
@@ -2275,7 +2300,7 @@ class GrokRegisterGUI:
                     if self.should_stop():
                         break
                     try:
-                        if browser is None:
+                        if _get_browser() is None:
                             start_browser(log_callback=self.log)
                         else:
                             restart_browser(log_callback=self.log)
@@ -2333,17 +2358,14 @@ def run_registration_cli(count):
 
     def _on_sigint(signum, frame):
         if controller.should_stop():
-            # 第二次：恢复默认并重新抛出，强制中断
             signal.signal(signal.SIGINT, _prev_sigint)
             raise KeyboardInterrupt
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
 
     signal.signal(signal.SIGINT, _on_sigint)
-    success_count = 0
-    fail_count = 0
-    retry_count_for_slot = 0
-    max_slot_retry = 3
+    stats_lock = threading.Lock()
+    state = {"success": 0, "fail": 0, "submitted": 0}
     # CI 用固定文件名便于收集 job 合并；本地带时间戳避免覆盖
     if _is_ci_env():
         accounts_output_file = os.path.join(os.path.dirname(__file__), "accounts.txt")
@@ -2352,138 +2374,149 @@ def run_registration_cli(count):
             os.path.dirname(__file__),
             f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
         )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}")
+    num_threads = int(config.get("register_threads", 2) or 2)
+    cli_log(f"[*] 终端模式启动，目标数量: {count}，并发线程: {num_threads}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
-    try:
-        start_browser(log_callback=cli_log)
-        cli_log("[*] 浏览器已启动")
-        i = 0
-        while i < count:
-            if controller.should_stop():
-                break
-            cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-            try:
-                email = ""
-                dev_token = ""
-                code = ""
-                mail_ok = False
-                max_mail_retry = 3
-                for mail_try in range(1, max_mail_retry + 1):
-                    cli_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                    try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
-                    cli_log("[*] 3. 拉取验证码")
-                    try:
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=cli_log,
-                            cancel_callback=controller.should_stop,
-                        )
-                        mail_ok = True
-                        break
-                    except Exception as mail_exc:
-                        msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                            cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=cli_log)
-                            sleep_with_cancel(1, controller.should_stop)
-                            continue
-                        raise
 
-                if not mail_ok:
-                    raise Exception("验证码阶段失败，已达到最大重试次数")
-                cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    cf_clearance, browser_ua = extract_cf_clearance_and_ua(log_callback=cli_log)
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=cli_log
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                success_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[+] 注册成功: {email}")
-                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
-                if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
-                    cleanup_runtime_memory(
-                        log_callback=cli_log,
-                        reason=f"已成功 {success_count} 个账号，执行定期清理",
-                    )
-            except RegistrationCancelled:
-                cli_log("[!] 注册被停止")
-                break
-            except AccountRetryNeeded as exc:
-                retry_count_for_slot += 1
-                if retry_count_for_slot <= max_slot_retry:
-                    cli_log(
-                        f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                    )
-                else:
-                    fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
-            except Exception as exc:
-                fail_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[-] 注册失败: {exc}")
-            finally:
+    def _register_worker(thread_id):
+        """单个注册线程：循环领取账号槽位直到总数达标或停止。"""
+        max_slot_retry = 3
+        while not controller.should_stop():
+            with stats_lock:
+                if state["submitted"] >= count:
+                    return
+                slot = state["submitted"]
+                state["submitted"] += 1
+            cli_log(f"--- [T{thread_id}] 开始第 {slot + 1}/{count} 个账号 ---")
+            retry_count_for_slot = 0
+            while True:
                 if controller.should_stop():
-                    break
+                    return
                 try:
-                    if browser is None:
-                        start_browser(log_callback=cli_log)
-                    else:
-                        restart_browser(log_callback=cli_log)
-                    # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                    time.sleep(1)
-                except KeyboardInterrupt:
-                    controller.stop()
-                    cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
+                    email = ""
+                    dev_token = ""
+                    code = ""
+                    mail_ok = False
+                    max_mail_retry = 3
+                    for mail_try in range(1, max_mail_retry + 1):
+                        cli_log(f"[*] [T{thread_id}] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+                        open_signup_page(
+                            log_callback=cli_log, cancel_callback=controller.should_stop
+                        )
+                        cli_log(f"[*] [T{thread_id}] 2. 创建邮箱并提交")
+                        email, dev_token = fill_email_and_submit(
+                            log_callback=cli_log, cancel_callback=controller.should_stop
+                        )
+                        cli_log(f"[*] [T{thread_id}] 邮箱: {email}")
+                        try:
+                            with open(
+                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                "a",
+                                encoding="utf-8",
+                            ) as f:
+                                f.write(f"{email}\t{dev_token}\n")
+                        except Exception:
+                            pass
+                        cli_log(f"[*] [T{thread_id}] 3. 拉取验证码")
+                        try:
+                            code = fill_code_and_submit(
+                                email,
+                                dev_token,
+                                log_callback=cli_log,
+                                cancel_callback=controller.should_stop,
+                            )
+                            mail_ok = True
+                            break
+                        except Exception as mail_exc:
+                            msg = str(mail_exc)
+                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                                cli_log(f"[!] [T{thread_id}] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                                restart_browser(log_callback=cli_log)
+                                sleep_with_cancel(1, controller.should_stop)
+                                continue
+                            raise
+
+                    if not mail_ok:
+                        raise Exception("验证码阶段失败，已达到最大重试次数")
+                    cli_log(f"[*] [T{thread_id}] 验证码: {code}")
+                    cli_log(f"[*] [T{thread_id}] 4. 填写资料")
+                    profile = fill_profile_and_submit(
+                        log_callback=cli_log, cancel_callback=controller.should_stop
+                    )
+                    cli_log(f"[*] [T{thread_id}] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                    cli_log(f"[*] [T{thread_id}] 5. 等待 sso cookie")
+                    sso = wait_for_sso_cookie(
+                        log_callback=cli_log, cancel_callback=controller.should_stop
+                    )
+                    if config.get("enable_nsfw", True):
+                        cli_log(f"[*] [T{thread_id}] 6. 开启 NSFW")
+                        cf_clearance, browser_ua = extract_cf_clearance_and_ua(log_callback=cli_log)
+                        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
+                            sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=cli_log
+                        )
+                        if nsfw_ok:
+                            cli_log(f"[+] [T{thread_id}] NSFW 开启成功: {nsfw_msg}")
+                        else:
+                            cli_log(f"[!] [T{thread_id}] NSFW 未开启，继续保存账号: {nsfw_msg}")
+                    try:
+                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        with stats_lock:
+                            with open(accounts_output_file, "a", encoding="utf-8") as f:
+                                f.write(line)
+                    except Exception as file_exc:
+                        cli_log(f"[Debug] [T{thread_id}] 保存账号文件失败: {file_exc}")
+                    with stats_lock:
+                        state["success"] += 1
+                        cli_log(f"[+] [T{thread_id}] 注册成功: {email} | 当前统计: 成功 {state['success']} | 失败 {state['fail']}")
                     break
                 except RegistrationCancelled:
-                    break
-                except Exception as restart_exc:
-                    if controller.should_stop():
+                    cli_log(f"[!] [T{thread_id}] 注册被停止")
+                    return
+                except AccountRetryNeeded as exc:
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        cli_log(
+                            f"[!] [T{thread_id}] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                        )
+                        continue
+                    else:
+                        with stats_lock:
+                            state["fail"] += 1
+                        cli_log(f"[-] [T{thread_id}] 当前账号已达到最大重试次数，跳过: {exc}")
                         break
-                    cli_log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                except Exception as exc:
+                    with stats_lock:
+                        state["fail"] += 1
+                    cli_log(f"[-] [T{thread_id}] 注册失败: {exc}")
+                    break
+                finally:
+                    if controller.should_stop():
+                        return
+                    try:
+                        if _get_browser() is None:
+                            start_browser(log_callback=cli_log)
+                        else:
+                            restart_browser(log_callback=cli_log)
+                        time.sleep(1)
+                    except KeyboardInterrupt:
+                        controller.stop()
+                        cli_log(f"[!] [T{thread_id}] 收到 Ctrl+C，正在停止")
+                        return
+                    except RegistrationCancelled:
+                        return
+                    except Exception as restart_exc:
+                        if controller.should_stop():
+                            return
+                        cli_log(f"[Debug] [T{thread_id}] 轮次清理/重启浏览器失败: {restart_exc}")
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+            futures = [pool.submit(_register_worker, t + 1) for t in range(num_threads)]
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:
+                    cli_log(f"[!] 线程异常: {exc}")
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
@@ -2501,7 +2534,7 @@ def run_registration_cli(count):
         except BaseException:
             pass
         try:
-            cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+            cli_log(f"[*] 任务结束。成功 {state['success']} | 失败 {state['fail']}")
         except BaseException:
             pass
         try:

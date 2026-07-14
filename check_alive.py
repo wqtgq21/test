@@ -303,15 +303,15 @@ def main() -> int:
 
     results, done = [], 0
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(check_one, a, proxies, args.timeout,
-                            args.cpa_url, args.cpa_key): a for a in accounts}
-        for fut in as_completed(futs):
-            r = fut.result()
-            results.append(r)
-            done += 1
-            tag = "OK " if r["ok"] else "BAD"
-            print(f"[{done:>3}/{total}] {tag} {r['email']} -> {r['detail']}", flush=True)
+    # 串行测活：不并发，每个账号测完等 5 秒，避免触发 Cloudflare 429
+    for acc in accounts:
+        r = check_one(acc, proxies, args.timeout, args.cpa_url, args.cpa_key)
+        results.append(r)
+        done += 1
+        tag = "OK " if r["ok"] else "BAD"
+        print(f"[{done:>3}/{total}] {tag} {r['email']} -> {r['detail']}", flush=True)
+        if done < total:
+            time.sleep(5)
 
     elapsed = time.time() - t0
     order = {a["email"]: i for i, a in enumerate(accounts)}
@@ -335,7 +335,7 @@ def main() -> int:
         print(f"\n失效 ({len(invalid)}):")
         for r in invalid:
             print(f"  {r['email']:30s} {r['detail']}")
-    return 0 if valid else 2
+    return 0
 
 
 if __name__ == "__main__":
