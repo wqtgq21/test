@@ -7,6 +7,6 @@
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
   "cpa_auto_add": true,
   "cpa_auth_dir": "",
-  "cpa_remote_url": "http://156.229.166.49:8317",
-  "cpa_management_key": "Nf5B8Smzi1AV3yN2F6MtJ6JTQI0cmo025PsZ1n8I"
+  "cpa_remote_url": "http://198.44.182.20:8001",
+  "cpa_management_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZG1pbklkIjoxLCJzZXNzaW9uSWQiOjEsImlzcyI6Imdyb2syYXBpIiwic3ViIjoiMSIsImV4cCI6MTc4NDAyNjMyMiwiaWF0IjoxNzg0MDI1NDIyfQ.4qwn3ARyKuXn-ainw0VG30DraXqjuiozOCr8lGEVQ44"
 }

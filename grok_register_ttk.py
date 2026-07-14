@@ -28,9 +28,6 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
-# SSO → CLIProxyAPI(CPA) 扁平格式转换（复用 sso_to_auth_json 的授权码流程 + 写入器）
-import sso_to_auth_json as _s2cpa
-
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
@@ -208,151 +205,6 @@ def _normalize_sso_token(raw_token):
     if token.startswith("sso="):
         token = token[4:]
     return token
-
-
-# ── 测活：用 access_token 调 grok build API（CPA 实际使用的通道）──
-BUILD_CHECK_ENDPOINT = "https://cli-chat-proxy.grok.com/v1/chat/completions"
-BUILD_CHECK_MODEL = "grok-4.5"
-BUILD_UA = "grok-shell/0.2.99 (linux; x86_64)"
-
-
-def check_build_alive(access_token, proxy="", timeout=30, max_retry=3):
-    """用 access_token 调 grok build API 验证账号真实可用性。
-
-    伪装成 grok-shell CLI，测 CPA 入库后实际使用的 cli-chat-proxy 通道。
-    返回 (ok: bool, detail: str)：
-      200 -> 模型回答        -> (True, "answered")
-      429 -> 认证通过限流    -> (True, "quota-exhausted")
-      403 + cloudflare       -> CF 拦截(非账号问题) -> (True, "cf-blocked")
-      403 其他               -> 权限拒绝 -> (False, "forbidden:...")
-      401/400                -> 认证失败 -> (False, "auth-fail:401")
-    """
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "X-XAI-Token-Auth": "xai-grok-cli",
-        "Content-Type": "application/json",
-        "x-grok-client-version": "0.2.99",
-        "x-grok-client-identifier": "grok-shell",
-        "x-grok-client-surface": "tui",
-        "x-grok-client-name": "grok-shell",
-        "User-Agent": BUILD_UA,
-    }
-    body = {
-        "model": BUILD_CHECK_MODEL,
-        "messages": [{"role": "user", "content": "1+1=?"}],
-        "max_tokens": 10,
-        "stream": False,
-    }
-    detail = ""
-    for attempt in range(max_retry):
-        try:
-            resp = requests.post(BUILD_CHECK_ENDPOINT, headers=headers, json=body, proxies=proxies, timeout=timeout)
-            code = resp.status_code
-            snippet = str(resp.text or "")[:300].lower()
-            if code == 200:
-                return True, "answered"
-            if code == 429:
-                return False, "quota-exhausted"
-            if code == 403:
-                if "cloudflare" in snippet or "just a moment" in snippet:
-                    return False, "cf-blocked"
-                return False, f"forbidden:{snippet[:80]}"
-            if code in (400, 401):
-                return False, f"auth-fail:{code}"
-            detail = f"http-{code}"
-            time.sleep(2.0 * (attempt + 1))
-            continue
-        except Exception as exc:
-            detail = f"err:{type(exc).__name__}"
-            time.sleep(1.5 * (attempt + 1))
-    return False, detail or "unknown"
-
-
-def _resolve_cpa_proxy():
-    """CPA 换 token 用的代理：优先 config.proxy，其次环境变量，最后本机 7890。CI 环境直连不走代理。"""
-    if _is_ci_env():
-        return ""
-    proxy = str(config.get("proxy", "") or "").strip()
-    if proxy:
-        return proxy
-    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
-        val = str(os.environ.get(key, "") or "").strip()
-        if val:
-            return val
-    return "http://127.0.0.1:7890"
-
-
-def add_sso_to_cpa(raw_token, email="", log_callback=None):
-    """SSO → 授权码流程换 token → 写入本地 CPA auth 目录和/或远程 CPA。
-
-    SSO 本身不是 CPA 认的凭据；必须先用授权码流程（referrer=grok-build）
-    换到 access/refresh token，再写成 CPA 的 xai-<email>.json
-    （type=xai + cli-chat-proxy base_url + grok-cli headers）。
-
-    - 本地：写入 cpa_auth_dir，CPA 监听热加载
-    - 远程：POST Management API /v0/management/auth-files（cpa_remote_url + cpa_management_key）
-    """
-    if not config.get("cpa_auto_add", False):
-        return
-    auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
-    remote_url = str(config.get("cpa_remote_url", "") or "").strip()
-    management_key = str(config.get("cpa_management_key", "") or "").strip()
-    if not auth_dir and not remote_url:
-        if log_callback:
-            log_callback("[Debug] 已开启 CPA 直出但未配置 cpa_auth_dir 或 cpa_remote_url，跳过")
-        return
-    if remote_url and not management_key:
-        if log_callback:
-            log_callback("[Debug] 已配置 cpa_remote_url 但未配置 cpa_management_key，跳过远程上传")
-        remote_url = ""
-    if not auth_dir and not remote_url:
-        return
-    sso = _normalize_sso_token(raw_token)
-    if not sso:
-        return
-    proxy = _resolve_cpa_proxy()
-
-    def _cpa_log(message):
-        if log_callback:
-            log_callback(f"[CPA] {str(message).strip()}")
-
-    try:
-        _cpa_log(f"SSO → 授权码流程换 token (proxy={proxy}) ...")
-        token = _s2cpa.sso_to_token(sso, proxy=proxy, log=_cpa_log)
-        if not token:
-            _cpa_log("授权码流程换 token 失败，跳过")
-            return
-        record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
-        ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
-        ref = ap.get("referrer")
-        if ref != "grok-build":
-            _cpa_log(f"警告: access_token referrer={ref!r}，预期 grok-build")
-        else:
-            _cpa_log("access_token referrer=grok-build OK")
-        # ── 测活：用 access_token 调 grok build API（复用已换到的 token，不再跑 device flow）──
-        _cpa_log("测活中（grok-shell 伪装调 cli-chat-proxy / grok-4.5）...")
-        alive_proxy = "" if _is_ci_env() else proxy
-        access_token = record.get("access_token", "") or token.get("access_token", "")
-        ok, detail = check_build_alive(access_token, proxy=alive_proxy)
-        if not ok:
-            _cpa_log(f"测活失败（{detail}），账号不可用，放弃入库")
-            return
-        _cpa_log(f"测活通过（{detail}），开始入库")
-        if auth_dir:
-            try:
-                path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
-                _cpa_log(f"已写入本地 {path}")
-            except Exception as local_exc:
-                _cpa_log(f"本地写入失败: {local_exc}")
-        if remote_url:
-            try:
-                name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
-                _cpa_log(f"已上传远程 {remote_url.rstrip('/')}/.../{name}")
-            except Exception as remote_exc:
-                _cpa_log(f"远程上传失败: {remote_exc}")
-    except Exception as exc:
-        _cpa_log(f"直出失败: {exc}")
 
 
 def _is_ci_env():
@@ -1782,7 +1634,7 @@ return 'filled-no-submit';
                     token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
                 if token_len == "0":
-                    pause_seconds = random.uniform(1, 3)
+                    pause_seconds = random.uniform(0.5, 1.5)
                     if log_callback:
                         log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
                     sleep_with_cancel(pause_seconds, cancel_callback)
@@ -1790,7 +1642,7 @@ return 'filled-no-submit';
                 if wait_cf_since is None:
                     wait_cf_since = now
                 # 卡住后自动二次复用 Turnstile 组件
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+                if now - wait_cf_since >= 3 and now - last_cf_retry_at >= 3:
                     if log_callback:
                         log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
                     try:
@@ -1881,7 +1733,7 @@ return 'submitted';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
+            if now - wait_cf_since >= 3 and now - last_cf_retry_at >= 3:
                 if log_callback:
                     log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
                 try:
@@ -1907,7 +1759,7 @@ return String(cfInput.value || '').trim().length;
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
                 last_cf_retry_at = now
-            sleep_with_cancel(0.8, cancel_callback)
+            sleep_with_cancel(0.3, cancel_callback)
             continue
 
         if submit_state == "submitted":
@@ -2012,7 +1864,7 @@ return 'final-page-clicked-submit';
                 if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
                     token_len = retried.split(":", 1)[1] if ":" in retried else "0"
                     log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
-                    if now - last_cf_retry_at >= 10:
+                    if now - last_cf_retry_at >= 3:
                         if log_callback:
                             log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
                         try:
@@ -2384,7 +2236,6 @@ class GrokRegisterGUI:
                             f.write(line)
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_sso_to_cpa(sso, email=email, log_callback=self.log)
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -2493,10 +2344,14 @@ def run_registration_cli(count):
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-    )
+    # CI 用固定文件名便于收集 job 合并；本地带时间戳避免覆盖
+    if _is_ci_env():
+        accounts_output_file = os.path.join(os.path.dirname(__file__), "accounts.txt")
+    else:
+        accounts_output_file = os.path.join(
+            os.path.dirname(__file__),
+            f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
@@ -2580,7 +2435,6 @@ def run_registration_cli(count):
                         f.write(line)
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_sso_to_cpa(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1

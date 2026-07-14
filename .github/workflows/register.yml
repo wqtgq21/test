@@ -13,7 +13,7 @@ on:
         required: true
         default: "2"
         type: choice
-        options: ["1", "2", "3", "4", "5", "6", "8", "10", "50", "100"]
+        options: ["1", "2", "3", "4", "5", "6", "8", "10"]
       count_per_runner:
         description: "每个 runner 注册账号数量"
         required: true
@@ -107,7 +107,95 @@ jobs:
         with:
           name: accounts-runner-${{ matrix.index }}
           path: |
-            accounts_*.txt
+            accounts.txt
             mail_credentials.txt
           if-no-files-found: ignore
           retention-days: 7
+
+  # ── Job 3：收集所有 runner 的账号，合并去重 → 测活 → 存活上传 CPA ──
+  collect:
+    needs: register
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码（含 check_alive.py）
+        uses: actions/checkout@v4
+
+      - name: 下载所有 runner 的 artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: accounts-runner-*
+          path: all_runners
+          merge-multiple: false
+
+      - name: 合并所有账号文件
+        shell: bash
+        run: |
+          set -e
+          mkdir -p merged
+          : > merged/all_accounts.txt
+          total=0
+          for d in all_runners/accounts-runner-*/; do
+            [ -d "$d" ] || continue
+            f="$d/accounts.txt"
+            if [ -f "$f" ]; then
+              echo "  + 合并 $f"
+              grep -v '^[[:space:]]*$' "$f" >> merged/all_accounts.txt || true
+              n=$(grep -cv '^[[:space:]]*$' "$f" || true)
+              total=$((total + n))
+            fi
+          done
+          # 整体去重（保留顺序）
+          if [ -s merged/all_accounts.txt ]; then
+            awk '!seen[$0]++' merged/all_accounts.txt > merged/all_accounts_dedup.txt
+            mv merged/all_accounts_dedup.txt merged/all_accounts.txt
+          fi
+          final=$(grep -cv '^[[:space:]]*$' merged/all_accounts.txt 2>/dev/null || echo 0)
+          echo "=============================================="
+          echo "合并完成：原始 $total 行，去重后 $final 行"
+          echo "--- 前 5 行预览 ---"
+          head -n 5 merged/all_accounts.txt || true
+          echo "=============================================="
+
+      - name: 读取 CPA 配置
+        id: cpa
+        shell: bash
+        run: |
+          if [ -f "gh/ci_config.json" ]; then
+            URL=$(python3 -c "import json;print(json.load(open('gh/ci_config.json')).get('cpa_remote_url',''))")
+            KEY=$(python3 -c "import json;print(json.load(open('gh/ci_config.json')).get('cpa_management_key',''))")
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "key=$KEY" >> "$GITHUB_OUTPUT"
+            echo "CPA 地址: $URL"
+          else
+            echo "[!] 未找到 gh/ci_config.json"
+          fi
+
+      - name: 测活 + 存活上传 CPA
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          if [ ! -s merged/all_accounts.txt ]; then
+            echo "[!] 无账号可测活，跳过"
+            exit 0
+          fi
+          python3 check_alive.py \
+            --input merged/all_accounts.txt \
+            --workers 3 \
+            --tokens-out merged/grok2api_tokens.txt \
+            --report merged/verify_report.json \
+            --cpa-url "${{ steps.cpa.outputs.url }}" \
+            --cpa-key "${{ steps.cpa.outputs.key }}"
+
+      - name: 上传结果包
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_id }}
+          path: |
+            merged/all_accounts.txt
+            merged/grok2api_tokens.txt
+            merged/verify_report.json
+          if-no-files-found: ignore
+          retention-days: 14
