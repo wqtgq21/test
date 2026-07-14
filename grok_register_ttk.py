@@ -2388,126 +2388,110 @@ def run_registration_cli(count):
                 slot = state["submitted"]
                 state["submitted"] += 1
             cli_log(f"--- [T{thread_id}] 开始第 {slot + 1}/{count} 个账号 ---")
-            retry_count_for_slot = 0
-            while True:
+            if controller.should_stop():
+                return
+            try:
+                email = ""
+                dev_token = ""
+                code = ""
+                mail_ok = False
+                max_mail_retry = 3
+                for mail_try in range(1, max_mail_retry + 1):
+                    cli_log(f"[*] [T{thread_id}] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+                    open_signup_page(
+                        log_callback=cli_log, cancel_callback=controller.should_stop
+                    )
+                    cli_log(f"[*] [T{thread_id}] 2. 创建邮箱并提交")
+                    email, dev_token = fill_email_and_submit(
+                        log_callback=cli_log, cancel_callback=controller.should_stop
+                    )
+                    cli_log(f"[*] [T{thread_id}] 邮箱: {email}")
+                    try:
+                        with open(
+                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                            "a",
+                            encoding="utf-8",
+                        ) as f:
+                            f.write(f"{email}\t{dev_token}\n")
+                    except Exception:
+                        pass
+                    cli_log(f"[*] [T{thread_id}] 3. 拉取验证码")
+                    try:
+                        code = fill_code_and_submit(
+                            email,
+                            dev_token,
+                            log_callback=cli_log,
+                            cancel_callback=controller.should_stop,
+                        )
+                        mail_ok = True
+                        break
+                    except Exception as mail_exc:
+                        msg = str(mail_exc)
+                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                            cli_log(f"[!] [T{thread_id}] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                            restart_browser(log_callback=cli_log)
+                            sleep_with_cancel(1, controller.should_stop)
+                            continue
+                        raise
+
+                if not mail_ok:
+                    raise Exception("验证码阶段失败，已达到最大重试次数")
+                cli_log(f"[*] [T{thread_id}] 验证码: {code}")
+                cli_log(f"[*] [T{thread_id}] 4. 填写资料")
+                profile = fill_profile_and_submit(
+                    log_callback=cli_log, cancel_callback=controller.should_stop
+                )
+                cli_log(f"[*] [T{thread_id}] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                cli_log(f"[*] [T{thread_id}] 5. 等待 sso cookie")
+                sso = wait_for_sso_cookie(
+                    log_callback=cli_log, cancel_callback=controller.should_stop
+                )
+                if config.get("enable_nsfw", True):
+                    cli_log(f"[*] [T{thread_id}] 6. 开启 NSFW")
+                    cf_clearance, browser_ua = extract_cf_clearance_and_ua(log_callback=cli_log)
+                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
+                        sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=cli_log
+                    )
+                    if nsfw_ok:
+                        cli_log(f"[+] [T{thread_id}] NSFW 开启成功: {nsfw_msg}")
+                    else:
+                        cli_log(f"[!] [T{thread_id}] NSFW 未开启，继续保存账号: {nsfw_msg}")
+                try:
+                    line = f"{email}----{profile.get('password','')}----{sso}\n"
+                    with stats_lock:
+                        with open(accounts_output_file, "a", encoding="utf-8") as f:
+                            f.write(line)
+                except Exception as file_exc:
+                    cli_log(f"[Debug] [T{thread_id}] 保存账号文件失败: {file_exc}")
+                with stats_lock:
+                    state["success"] += 1
+                    cli_log(f"[+] [T{thread_id}] 注册成功: {email} | 当前统计: 成功 {state['success']} | 失败 {state['fail']}")
+            except RegistrationCancelled:
+                cli_log(f"[!] [T{thread_id}] 注册被停止")
+                return
+            except Exception as exc:
+                with stats_lock:
+                    state["fail"] += 1
+                cli_log(f"[-] [T{thread_id}] 注册失败，跳过: {exc}")
+            finally:
                 if controller.should_stop():
                     return
                 try:
-                    email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        cli_log(f"[*] [T{thread_id}] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=cli_log, cancel_callback=controller.should_stop
-                        )
-                        cli_log(f"[*] [T{thread_id}] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=cli_log, cancel_callback=controller.should_stop
-                        )
-                        cli_log(f"[*] [T{thread_id}] 邮箱: {email}")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
-                        cli_log(f"[*] [T{thread_id}] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=cli_log,
-                                cancel_callback=controller.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                cli_log(f"[!] [T{thread_id}] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=cli_log)
-                                sleep_with_cancel(1, controller.should_stop)
-                                continue
-                            raise
-
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    cli_log(f"[*] [T{thread_id}] 验证码: {code}")
-                    cli_log(f"[*] [T{thread_id}] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] [T{thread_id}] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    cli_log(f"[*] [T{thread_id}] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    if config.get("enable_nsfw", True):
-                        cli_log(f"[*] [T{thread_id}] 6. 开启 NSFW")
-                        cf_clearance, browser_ua = extract_cf_clearance_and_ua(log_callback=cli_log)
-                        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=cli_log
-                        )
-                        if nsfw_ok:
-                            cli_log(f"[+] [T{thread_id}] NSFW 开启成功: {nsfw_msg}")
-                        else:
-                            cli_log(f"[!] [T{thread_id}] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with stats_lock:
-                            with open(accounts_output_file, "a", encoding="utf-8") as f:
-                                f.write(line)
-                    except Exception as file_exc:
-                        cli_log(f"[Debug] [T{thread_id}] 保存账号文件失败: {file_exc}")
-                    with stats_lock:
-                        state["success"] += 1
-                        cli_log(f"[+] [T{thread_id}] 注册成功: {email} | 当前统计: 成功 {state['success']} | 失败 {state['fail']}")
-                    break
-                except RegistrationCancelled:
-                    cli_log(f"[!] [T{thread_id}] 注册被停止")
-                    return
-                except AccountRetryNeeded as exc:
-                    retry_count_for_slot += 1
-                    if retry_count_for_slot <= max_slot_retry:
-                        cli_log(
-                            f"[!] [T{thread_id}] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                        )
-                        continue
+                    if _get_browser() is None:
+                        start_browser(log_callback=cli_log)
                     else:
-                        with stats_lock:
-                            state["fail"] += 1
-                        cli_log(f"[-] [T{thread_id}] 当前账号已达到最大重试次数，跳过: {exc}")
-                        break
-                except Exception as exc:
-                    with stats_lock:
-                        state["fail"] += 1
-                    cli_log(f"[-] [T{thread_id}] 注册失败: {exc}")
-                    break
-                finally:
+                        restart_browser(log_callback=cli_log)
+                    time.sleep(1)
+                except KeyboardInterrupt:
+                    controller.stop()
+                    cli_log(f"[!] [T{thread_id}] 收到 Ctrl+C，正在停止")
+                    return
+                except RegistrationCancelled:
+                    return
+                except Exception as restart_exc:
                     if controller.should_stop():
                         return
-                    try:
-                        if _get_browser() is None:
-                            start_browser(log_callback=cli_log)
-                        else:
-                            restart_browser(log_callback=cli_log)
-                        time.sleep(1)
-                    except KeyboardInterrupt:
-                        controller.stop()
-                        cli_log(f"[!] [T{thread_id}] 收到 Ctrl+C，正在停止")
-                        return
-                    except RegistrationCancelled:
-                        return
-                    except Exception as restart_exc:
-                        if controller.should_stop():
-                            return
-                        cli_log(f"[Debug] [T{thread_id}] 轮次清理/重启浏览器失败: {restart_exc}")
+                    cli_log(f"[Debug] [T{thread_id}] 轮次清理/重启浏览器失败: {restart_exc}")
 
     try:
         with ThreadPoolExecutor(max_workers=num_threads) as pool:
