@@ -13,7 +13,7 @@ on:
         required: true
         default: "2"
         type: choice
-        options: ["10", "20", "30", "40", "50", "60", "80", "100"]
+        options: ["1", "2", "3", "4", "5", "6", "8", "10"]
       count_per_runner:
         description: "每个 runner 注册账号数量"
         required: true
@@ -136,7 +136,6 @@ jobs:
       - name: 合并所有账号文件
         shell: bash
         run: |
-          set -e
           mkdir -p merged
           : > merged/all_accounts.txt
           total=0
@@ -146,7 +145,7 @@ jobs:
             if [ -f "$f" ]; then
               echo "  + 合并 $f"
               grep -v '^[[:space:]]*$' "$f" >> merged/all_accounts.txt || true
-              n=$(grep -cv '^[[:space:]]*$' "$f" || true)
+              n=$(grep -cv '^[[:space:]]*$' "$f" 2>/dev/null || echo 0)
               total=$((total + n))
             fi
           done
@@ -158,6 +157,7 @@ jobs:
           final=$(grep -cv '^[[:space:]]*$' merged/all_accounts.txt 2>/dev/null || echo 0)
           echo "=============================================="
           echo "合并完成：原始 $total 行，去重后 $final 行"
+          echo "合并文件：merged/all_accounts.txt"
           echo "--- 前 5 行预览 ---"
           head -n 5 merged/all_accounts.txt || true
           echo "=============================================="
