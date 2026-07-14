@@ -1,0 +1,113 @@
+name: Grok 批量注册 (Windows)
+
+# ──────────────────────────────────────────────────────────────
+# 触发方式：
+#   1) 手动：Actions → 选本 workflow → 填 runner 数量 / 每台注册数 → Run
+#   2) 定时：取消下方 cron 注释即每天定时自动跑
+# ──────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: "并行 runner 数量（每台机器独立并发）"
+        required: true
+        default: "2"
+        type: choice
+        options: ["1", "2", "3", "4", "5", "6", "8", "10"]
+      count_per_runner:
+        description: "每个 runner 注册账号数量"
+        required: true
+        default: "5"
+        type: string
+  # schedule:
+  #   - cron: "0 8 * * *"
+
+jobs:
+  # ── Job 1：根据输入的 runner 数量生成并发索引矩阵 ──
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      total: ${{ steps.gen.outputs.total }}
+    steps:
+      - id: gen
+        shell: bash
+        run: |
+          N="${{ github.event.inputs.runners || '2' }}"
+          IDX=""
+          for i in $(seq 1 "$N"); do
+            [ -n "$IDX" ] && IDX="$IDX,"
+            IDX="$IDX\"$i\""
+          done
+          echo "matrix=[$IDX]" >> "$GITHUB_OUTPUT"
+          echo "total=$N" >> "$GITHUB_OUTPUT"
+
+  # ── Job 2：每个索引在一台 windows 机器上跑注册 ──
+  register:
+    needs: prepare
+    name: Runner ${{ matrix.index }} / 共 ${{ needs.prepare.outputs.total }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 确认 Chrome 可用
+        shell: pwsh
+        run: |
+          $paths = @(
+            "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          )
+          $found = $false
+          foreach ($p in $paths) {
+            if (Test-Path $p) { Write-Host "Chrome: $p"; & $p --version; $found = $true; break }
+          }
+          if (-not $found) { Write-Host "[!] 未找到 Chrome" }
+
+      - name: 写入 CI 配置
+        shell: pwsh
+        run: |
+          if (Test-Path "gh\ci_config.json") {
+            Copy-Item "gh\ci_config.json" "config.json" -Force
+            Write-Host "已写入 gh/ci_config.json -> config.json"
+          } else {
+            Write-Host "[!] 未找到 gh/ci_config.json，使用仓库内 config.json"
+          }
+
+      - name: 运行注册（非交互模式）
+        env:
+          CI: "true"
+          GROK_REG_CI: "true"
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        shell: pwsh
+        run: |
+          $count = "${{ github.event.inputs.count_per_runner || '5' }}"
+          Write-Host "===== Runner ${{ matrix.index }} 开始注册：目标 $count 个 ====="
+          python grok_register_ttk.py --ci --count $count
+
+      - name: 上传账号文件（artifact）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accounts-runner-${{ matrix.index }}
+          path: |
+            accounts_*.txt
+            mail_credentials.txt
+          if-no-files-found: ignore
+          retention-days: 7
