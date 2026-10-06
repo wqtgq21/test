@@ -1,217 +1,124 @@
-name: Grok 批量注册 (Windows)
 
-# ──────────────────────────────────────────────────────────────
-# 触发方式：
-#   1) 手动：Actions → 选本 workflow → 填 runner 数量 / 每台注册数 → Run
-#   2) 定时：取消下方 cron 注释即每天定时自动跑
-# ──────────────────────────────────────────────────────────────
+name: "Twitch Register"
+
 on:
   workflow_dispatch:
     inputs:
-      runners:
-        description: "并行 runner 数量（每台机器独立并发）"
-        required: true
-        default: "2"
-        type: choice
-        options: ["1", "2", "3", "40", "5", "6", "8", "10"]
-      count_per_runner:
-        description: "每个 runner 注册账号数量"
-        required: true
-        default: "5"
-        type: string
-      check_alive:
-        description: "是否测活（关闭则只注册+打包，不测活不上传CPA）"
-        required: true
-        default: "true"
-        type: choice
-        options: ["true", "false"]
-  # schedule:
-  #   - cron: "0 8 * * *"
+      server_ip:
+        description: "上传账号的服务器 IP（默认 198.44.182.20，不用改）"
+        required: false
+        default: "198.44.182.20"
+      job_count:
+        description: "job 数量 = 并发机器数（1-256，默认 256）"
+        required: false
+        default: "256"
+      worker_count:
+        description: "每个 job 的线程数 = 浏览器数（默认 3）"
+        required: false
+        default: "3"
+
+env:
+  # Windows runner 控制台是 cp1252，中文日志会崩 → 强制 UTF-8
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+  # ---- 出口：WARP（自选端点，池内随机挑；5025 换端点）----
+  WARP: "1"
+  WARP_ROTATE: "true"
+  # WARP_IP: "162.159.192.1"                  # 想固定某个入口 IP 就填这里
+  # WARP_ENDPOINTS: "162.159.192.1:2408,162.159.193.5:2408"   # 或指定一个池
+  # WARP_ROTATE_EACH_ACCOUNT: "false"         # true=一个账号换一个出口（更慢）
+
+  # ---- 浏览器 ----
+  CAMO_HEADLESS: "1"                          # 1=无头（推荐）；0=有头
+  # CAMO_LOCALE: "zh-CN"                      # 默认 zh-CN
+  # CAMO_TZ: "Asia/Shanghai"                  # 默认 Asia/Shanghai
+  # CAMO_GEOIP: "0"                           # 1=按出口 IP 自动推语言/时区（注意：可能被判 zh-HK）
+
+  # ---- 账号与上传 ----
+  SERVER_IP: ${{ github.event.inputs.server_ip }}
+  WORKER_COUNT: ${{ github.event.inputs.worker_count }}
+  ACCOUNTS_PER_WORKER: "150"
+  LOGURU_LEVEL: "INFO"
 
 jobs:
-  # ── Job 1：根据输入的 runner 数量生成并发索引矩阵 ──
+  # 生成 job 矩阵（列表形式；register 用 matrix.index 取）
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-      total: ${{ steps.gen.outputs.total }}
     steps:
-      - id: gen
-        shell: bash
+      - name: 生成 job 矩阵
+        id: gen
         run: |
-          N="${{ github.event.inputs.runners || '2' }}"
-          IDX=""
-          for i in $(seq 1 "$N"); do
-            [ -n "$IDX" ] && IDX="$IDX,"
-            IDX="$IDX\"$i\""
-          done
-          echo "matrix=[$IDX]" >> "$GITHUB_OUTPUT"
-          echo "total=$N" >> "$GITHUB_OUTPUT"
+          n="${{ github.event.inputs.job_count }}"
+          case "$n" in ''|*[!0-9]*) n=256;; esac
+          if [ "$n" -lt 1 ]; then n=1; fi
+          if [ "$n" -gt 256 ]; then n=256; fi     # GitHub 单次运行最多 256 个 job
+          python3 -c "import json; print('matrix=' + json.dumps(list(range($n))))" >> "$GITHUB_OUTPUT"
+          echo "将启动 $n 个并发 job"
 
-  # ── Job 2：每个索引在一台 windows 机器上跑注册 ──
   register:
     needs: prepare
-    name: Runner ${{ matrix.index }} / 共 ${{ needs.prepare.outputs.total }}
     runs-on: windows-latest
+    timeout-minutes: 360
+    name: reg-${{ matrix.index }}
     strategy:
       fail-fast: false
       matrix:
         index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
 
-      - name: 设置 Python 3.13
+    steps:
+      - name: 拉取注册机代码（私有仓库）
+        uses: actions/checkout@v4
+        with:
+          repository: xbox-cn/tw-reg-test-ad
+          # 优先用你配置的 Secret/Variable（PRIVATE_REPO_ACCESS_KEY）；没配时回退到本仓库默认 token
+          # （所以本仓库自测也能直接跑；外部用户必须配 PRIVATE_REPO_ACCESS_KEY）
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY || github.token }}
+          path: reg
+          fetch-depth: 1
+
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.10"
 
       - name: 安装依赖
-        shell: pwsh
+        working-directory: reg
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 确认 Chrome 可用
-        shell: pwsh
-        run: |
-          $paths = @(
-            "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
-            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-          )
-          $found = $false
-          foreach ($p in $paths) {
-            if (Test-Path $p) { Write-Host "Chrome: $p"; & $p --version; $found = $true; break }
-          }
-          if (-not $found) { Write-Host "[!] 未找到 Chrome" }
+      - name: 下载 Camoufox 指纹 Firefox 本体
+        working-directory: reg
+        run: python -m camoufox fetch
 
-      - name: 写入 CI 配置
-        shell: pwsh
+      - name: 出口探针（确认 WARP 出口地区，诊断用，不阻断）
+        continue-on-error: true
+        working-directory: reg
         run: |
-          if (Test-Path "gh\ci_config.json") {
-            Copy-Item "gh\ci_config.json" "config.json" -Force
-            Write-Host "已写入 gh/ci_config.json -> config.json"
-          } else {
-            Write-Host "[!] 未找到 gh/ci_config.json，使用仓库内 config.json"
-          }
+          python -c "
+          import warp_proxy, requests
+          url = warp_proxy.resolve_proxy()
+          print('proxy:', url, '| warp endpoint:', warp_proxy.current_endpoint())
+          if url:
+              px = {'http': url, 'https': url}
+              for line in requests.get('https://cloudflare.com/cdn-cgi/trace', proxies=px, timeout=20).text.splitlines():
+                  if line.startswith(('ip=', 'loc=', 'colo=', 'warp=')):
+                      print(' ', line)
+          "
 
-      - name: 运行注册（非交互模式）
-        env:
-          CI: "true"
-          GROK_REG_CI: "true"
-          PYTHONUTF8: "1"
-          PYTHONIOENCODING: "utf-8"
-        shell: pwsh
-        run: |
-          $count = "${{ github.event.inputs.count_per_runner || '5' }}"
-          Write-Host "===== Runner ${{ matrix.index }} 开始注册：目标 $count 个 ====="
-          python grok_register_ttk.py --ci --count $count
+      - name: 跑注册
+        working-directory: reg
+        run: python run.py
 
-      - name: 上传账号文件（artifact）
+      - name: 上传日志（无论成败）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: accounts-runner-${{ matrix.index }}
+          name: logs-job${{ matrix.index }}
           path: |
-            accounts.txt
-            mail_credentials.txt
-          if-no-files-found: ignore
+            reg/logs/
+            reg/warp-data/
           retention-days: 7
-
-  # ── Job 3：收集所有 runner 的账号，合并去重 → 测活 → 存活上传 CPA ──
-  collect:
-    needs: register
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出代码（含 check_alive.py）
-        uses: actions/checkout@v4
-
-      - name: 下载所有 runner 的 artifact
-        uses: actions/download-artifact@v4
-        with:
-          pattern: accounts-runner-*
-          path: all_runners
-          merge-multiple: false
-
-      - name: 合并所有账号文件
-        shell: bash
-        run: |
-          mkdir -p merged
-          : > merged/all_accounts.txt
-          total=0
-          for d in all_runners/accounts-runner-*/; do
-            [ -d "$d" ] || continue
-            f="$d/accounts.txt"
-            if [ -f "$f" ]; then
-              echo "  + 合并 $f"
-              grep -v '^[[:space:]]*$' "$f" >> merged/all_accounts.txt || true
-              n=$(grep -cv '^[[:space:]]*$' "$f" 2>/dev/null || echo 0)
-              total=$((total + n))
-            fi
-          done
-          # 整体去重（保留顺序）
-          if [ -s merged/all_accounts.txt ]; then
-            awk '!seen[$0]++' merged/all_accounts.txt > merged/all_accounts_dedup.txt
-            mv merged/all_accounts_dedup.txt merged/all_accounts.txt
-          fi
-          final=$(grep -cv '^[[:space:]]*$' merged/all_accounts.txt 2>/dev/null || echo 0)
-          echo "=============================================="
-          echo "合并完成：原始 $total 行，去重后 $final 行"
-          echo "合并文件：merged/all_accounts.txt"
-          echo "--- 前 5 行预览 ---"
-          head -n 5 merged/all_accounts.txt || true
-          echo "=============================================="
-
-      - name: 读取 CPA 配置
-        if: ${{ github.event.inputs.check_alive == 'true' }}
-        id: cpa
-        shell: bash
-        run: |
-          if [ -f "gh/ci_config.json" ]; then
-            URL=$(python3 -c "import json;print(json.load(open('gh/ci_config.json')).get('cpa_remote_url',''))")
-            KEY=$(python3 -c "import json;print(json.load(open('gh/ci_config.json')).get('cpa_management_key',''))")
-            echo "url=$URL" >> "$GITHUB_OUTPUT"
-            echo "key=$KEY" >> "$GITHUB_OUTPUT"
-            echo "CPA 地址: $URL"
-          else
-            echo "[!] 未找到 gh/ci_config.json"
-          fi
-
-      - name: 测活 + 存活上传 CPA
-        if: ${{ github.event.inputs.check_alive == 'true' }}
-        shell: bash
-        env:
-          PYTHONUTF8: "1"
-          PYTHONIOENCODING: "utf-8"
-        run: |
-          if [ ! -s merged/all_accounts.txt ]; then
-            echo "[!] 无账号可测活，跳过"
-            exit 0
-          fi
-          python3 check_alive.py \
-            --input merged/all_accounts.txt \
-            --workers 3 \
-            --tokens-out merged/grok2api_tokens.txt \
-            --report merged/verify_report.json \
-            --cpa-url "${{ steps.cpa.outputs.url }}" \
-            --cpa-key "${{ steps.cpa.outputs.key }}"
-
-      - name: 跳过测活提示
-        if: ${{ github.event.inputs.check_alive != 'true' }}
-        shell: bash
-        run: |
-          echo "=============================================="
-          echo "已跳过测活（check_alive=false），仅注册+打包"
-          echo "=============================================="
-
-      - name: 上传结果包
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-${{ github.run_id }}
-          path: |
-            merged/all_accounts.txt
-            merged/grok2api_tokens.txt
-            merged/verify_report.json
-          if-no-files-found: ignore
-          retention-days: 14
